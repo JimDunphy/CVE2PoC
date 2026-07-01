@@ -1,15 +1,13 @@
-# CVE2PoC - Zimbra defensive fork
+# CVE2PoC - Zimbra defensive CVE tracking
 
-This fork keeps the original CVE2PoC public-PoC lookup features, but adds the
-workflow this checkout is currently built around: tracking Zimbra CVEs, public
-PoCs, CISA KEV, EPSS, weaponized modules, and whether a credible fix record is
-visible.
+This tool helps Zimbra operators track CVEs, public PoCs, CISA KEV, EPSS,
+weaponized modules, and whether a credible fix record is visible. It also keeps
+the general CVE2PoC public-PoC lookup features available for single-CVE
+research.
 
-The fork is maintained by J Dunphy. Fork-specific bugs and behavior belong in
-this fork.
-
-The reason for the fork is operational: one way to defend a Zimbra deployment is
-to see what public security research and exploit indexes already expose. Zimbra
+The reason for this project is operational: one way to defend a Zimbra
+deployment is to see what public security research and exploit indexes already
+expose. Zimbra
 security information is spread across vendor release notes, NVD/CVE.org, exploit
 indexes, and third-party CVE sites, and those sources can lag, disagree, or
 disappear behind broken filtered views. This tool pulls those signals together
@@ -52,8 +50,8 @@ installed tool lives at:
 - uv tool env: `~/.local/share/uv/tools/cve2poc/`
 
 When `zimbra-cve.sh` is run from a checkout that contains `pyproject.toml`,
-`install` and `update` install from that local checkout. They do not pull the
-upstream GitHub project.
+`install` and `update` install from that local checkout. They do not pull from a
+remote GitHub project.
 
 If you answer no, install `uv` yourself and rerun `./zimbra-cve.sh install`.
 In non-interactive shells, the script refuses to bootstrap `uv`.
@@ -65,7 +63,7 @@ uv tool install --force --python 3.12 <path-to-this-checkout>
 ```
 
 Install from this checkout or from `JimDunphy/CVE2PoC` if you need the
-Zimbra/watch/fix-triage features from this fork.
+Zimbra/watch/fix-triage features.
 
 ## Direct `cve2poc` Commands
 
@@ -107,7 +105,7 @@ Run `cve2poc --help` for the complete current option list.
 
 - [QuickStart.md](QuickStart.md) - shortest path for the Zimbra workflow.
 - [doc/usage.md](doc/usage.md) - direct `cve2poc` usage and watch-mode details.
-- [doc/SCOPE.md](doc/SCOPE.md) - what this fork is and is not trying to do.
+- [doc/SCOPE.md](doc/SCOPE.md) - what this project is and is not trying to do.
 
 ## Scope And Safety
 
@@ -121,7 +119,7 @@ those are printed as references only and are not executed.
 
 ## Acknowledgement
 
-This project began as a GPLv3 fork of
-[CVE2PoC](https://github.com/0liverFlow/CVE2PoC) by Olivier Konaté. This fork is
-independently maintained for defensive Zimbra CVE tracking; issues and behavior
-specific to this fork belong here.
+This project began from the GPLv3
+[CVE2PoC](https://github.com/0liverFlow/CVE2PoC) project by Olivier Konaté. It
+is independently maintained for defensive Zimbra CVE tracking; project-specific
+issues and behavior belong here.

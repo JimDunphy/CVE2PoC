@@ -118,3 +118,10 @@ can make a patching or mitigation decision.
 It does not exploit systems, run PoCs, scan hosts, or touch a target site. Some
 single-CVE output includes example command snippets or links for external tools;
 those are printed as references only and are not executed.
+
+## Acknowledgement
+
+This project began as a GPLv3 fork of
+[CVE2PoC](https://github.com/0liverFlow/CVE2PoC) by Olivier Konaté. This fork is
+independently maintained for defensive Zimbra CVE tracking; issues and behavior
+specific to this fork belong here.

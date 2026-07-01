@@ -7,13 +7,15 @@ from CVE2PoC.core.user_agent import get_user_agent
 
 def search_ctf_labs(cve_id):
     """
-    This function returns HackTheBox and TryHackMe hands-on labs related to a CVE ID
+    This function returns hands-on labs related to a CVE ID
 
     :param cve_id: The CVE ID specified by the user
     """
     labs = {}
     # Searching HTB machines related to CVE ID
-    xdf = requests.get("https://0xdf.gitlab.io/tags", {"User-Agent": get_user_agent()})
+    xdf = requests.get(
+        "https://0xdf.gitlab.io/tags", headers={"User-Agent": get_user_agent()}
+    )
     soup = bsoup(xdf.text, "html.parser")
     cve_selector = soup.select(f'h2[id="{cve_id}" i] + ul')
     if cve_selector:
@@ -22,16 +24,6 @@ def search_ctf_labs(cve_id):
             "https://www.hackthebox.com/machines/"
             + cve_selector[0].select("a")[0].text.split()[1].lower()
         )
-    # Searching THM machines related to CVE ID
-    response = requests.get(
-        "https://raw.githubusercontent.com/0liverFlow/CVE2PoC-CI/refs/heads/main/latest_thm_rooms.txt",
-        {"User-Agent": get_user_agent()},
-    )
-    thm_machines = response.text.split("\n")
-    for machine in thm_machines:
-        if machine.split(":", 1)[0].upper() == cve_id.upper():
-            labs["thm"] = machine.split(":", 1)[-1]
-            break
     return labs
 
 

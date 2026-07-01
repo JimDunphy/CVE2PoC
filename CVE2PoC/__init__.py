@@ -23,6 +23,7 @@ import platform
 import subprocess
 import re
 import os
+import socket
 from getpass import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -46,6 +47,7 @@ from CVE2PoC.core.exploits import (
     get_exploit_programming_language,
 )
 from CVE2PoC.core.display import display_cve_info, display_poc_info
+from CVE2PoC.core.triage import compute_triage, display_triage
 from CVE2PoC.core.cve import (
     check_cve_id_format,
     check_ransomware_group_usage,
@@ -58,6 +60,12 @@ from CVE2PoC.core.cve import (
     get_cve_references,
 )
 from CVE2PoC.core.config import BASE_DIR
+
+# Single source of truth for the version (read dynamically by hatchling in
+# pyproject.toml). Bump this on every change.
+__version__ = "1.5.5"
+__fork_name__ = "Zimbra defensive fork"
+__fork_maintainer__ = "J Dunphy"
 
 
 def main():
@@ -114,6 +122,45 @@ def main():
         metavar="CVE ID",
         help="Search Bug Bounty reports related to a CVE ID",
     )
+    parser.add_argument(
+        "--zimbra-cpe",
+        type=str,
+        metavar="VERSION",
+        dest="zimbra_cpe",
+        help="Resolve a Zimbra version (train like 10.1, or exact like 10.1.16) to a CPE and print it",
+    )
+    parser.add_argument(
+        "--zimbra-scan",
+        type=str,
+        metavar="VERSION",
+        dest="zimbra_scan",
+        help="Discover ALL Zimbra CVEs (NVD keyword search), triage, and sort by relevance to a version",
+    )
+    parser.add_argument(
+        "--list",
+        type=str,
+        metavar="CPE",
+        dest="list_cpe",
+        help="Show the full current CVE triage table for a product (CPE); read-only",
+    )
+    parser.add_argument(
+        "--watch",
+        type=str,
+        metavar="CPE",
+        help="Monitor a product (CPE) and report new/worsening CVEs since the last run",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=str,
+        metavar="FILE",
+        help="State file for --watch (default: ~/.cve2poc/watch/<cpe-slug>-<hash>.json)",
+    )
+    parser.add_argument(
+        "--show-state",
+        type=str,
+        metavar="FILE",
+        help="Render a saved --watch state file as a risk table (no network)",
+    )
     parser.add_argument("-l", "--language", help="Filter PoCs by programming language")
     parser.add_argument(
         "--limit", type=int, default=10, help="Number of PoCs to display"
@@ -131,10 +178,37 @@ def main():
         action="store_true",
         help="Configure your GitHub and NVD API keys (Not required)",
     )
-    parser.add_argument("--no-banner", action="store_true", help="Remove banner")
+    parser.add_argument(
+        "--banner", action="store_true", help="Display the ASCII banner"
+    )
+    # Deprecated: the banner is now off by default, so --no-banner is a no-op.
+    # Kept (hidden) so existing scripts/cron jobs don't break.
+    parser.add_argument(
+        "--no-banner", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="store_true",
+        help="Show version and exit",
+    )
     # Enable argcomplete
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
+
+    # Bound every network operation so a stalled endpoint can't hang the tool
+    # forever. requests without an explicit timeout inherit this socket default,
+    # so this covers all call sites at once. It's a per-read timeout, so slow
+    # (but progressing) downloads still succeed; only genuine stalls are cut off.
+    socket.setdefaulttimeout(30)
+
+    # Version (shows the banner too — that's what it's for now)
+    if args.version:
+        banner()
+        rprint(f"CVE2PoC [spring_green2]v{__version__}[/spring_green2]")
+        rprint(f"{__fork_name__} maintained by [bright_blue]{__fork_maintainer__}[/bright_blue]")
+        rprint("Fork-specific bugs belong in this fork.")
+        sys.exit(0)
 
     # API keys configuration (This is not required)
     load_dotenv()
@@ -361,8 +435,50 @@ def main():
             rprint("\n[red3][-][/red3] No reports found for this CVE ID!")
         sys.exit(0)
 
-    # Display banner
-    if not args.no_banner:
+    # Resolve a Zimbra version spec to a CPE and print it (for the helper script).
+    # CPE goes to stdout (capturable); the resolution note goes to stderr.
+    if args.zimbra_cpe:
+        from CVE2PoC.core.zimbra import resolve
+
+        try:
+            resolved_version, cpe = resolve(args.zimbra_cpe)
+        except ValueError as exc:
+            print(f"[-] {exc}", file=sys.stderr)
+            sys.exit(2)
+        if resolved_version != args.zimbra_cpe.strip():
+            print(
+                f"[*] Zimbra {args.zimbra_cpe} -> latest {resolved_version}",
+                file=sys.stderr,
+            )
+        print(cpe)
+        sys.exit(0)
+
+    # Discover all Zimbra CVEs (keyword) and sort by relevance to a version
+    if args.zimbra_scan:
+        from CVE2PoC.core.watch import run_zimbra_scan
+
+        sys.exit(run_zimbra_scan(args.zimbra_scan, headers, args.threads))
+
+    # Show the full current CVE triage table for a CPE (read-only)
+    if args.list_cpe:
+        from CVE2PoC.core.watch import run_list
+
+        sys.exit(run_list(args.list_cpe, headers, args.threads))
+
+    # Render a saved watch state file as a table (offline)
+    if args.show_state:
+        from CVE2PoC.core.watch import show_state
+
+        sys.exit(show_state(args.show_state))
+
+    # Product watch mode: monitor a CPE and report new/worsening CVEs
+    if args.watch:
+        from CVE2PoC.core.watch import run_watch
+
+        sys.exit(run_watch(args.watch, args.state_file, headers, args.threads))
+
+    # Display banner (opt-in; off by default)
+    if args.banner:
         banner()
 
     if args.limit < 1:
@@ -442,7 +558,9 @@ def main():
                             continue
                         elif cve_record["state"] == "RESERVED":
                             rprint(
-                                f"{cve_id.upper()} is [bold]reserved[/bold]. No entry is available in the NVD. Refer to CVE.org for more information."
+                                f"[gold1][!][/gold1] Skipping {cve_id.upper()}: [bold]reserved[/bold] by "
+                                f"[cyan1]{cve_record.get('owning_cna', 'N/A')}[/cyan1], not yet published "
+                                f"(https://www.cve.org/CVERecord?id={cve_id.upper()})"
                             )
                             continue
                         elif cve_record["state"] == "REJECTED":
@@ -576,7 +694,11 @@ def main():
             # Check the state of the CVE ID
             elif cve_record["state"] == "RESERVED":
                 rprint(
-                    f"{cve_id.upper()} is [bold]reserved[/bold]. No entry is available in the NVD. Refer to CVE.org for more information."
+                    f"{cve_id.upper()} is [bold]reserved[/bold] by [cyan1]{cve_record.get('owning_cna', 'N/A')}[/cyan1]. "
+                    f"No details have been published yet, so there is nothing to search for PoCs against."
+                )
+                rprint(
+                    f"    Track it at: https://www.cve.org/CVERecord?id={cve_id.upper()}"
                 )
                 sys.exit(0)
             elif cve_record["state"] == "REJECTED":
@@ -638,6 +760,9 @@ def main():
                 sys.exit(0)
 
             # Search PoCs
+            # Track public-PoC signals for the defensive triage summary
+            gh_poc_count = 0
+            gh_max_stars = 0
             progress.add_task(
                 description="[bright_blue][*][/bright_blue] Searching Exploits...",
                 total=None,
@@ -653,6 +778,8 @@ def main():
                     reverse=True,
                 )
                 n_pocs = len(sorted_pocs)
+                gh_poc_count = n_pocs
+                gh_max_stars = sorted_pocs[0]["stargazers_count"] if sorted_pocs else 0
                 for i in range(n_pocs):
                     # By default, the program will return the first 10 exploits. This behavior can be changed by specifying the args.limit option
                     if i < args.limit:
@@ -754,6 +881,10 @@ def main():
                             key=lambda x: (x["stargazers_count"], x["forks"]),
                             reverse=True,
                         )
+                        gh_poc_count = len(sorted_pocs)
+                        gh_max_stars = (
+                            sorted_pocs[0]["stargazers_count"] if sorted_pocs else 0
+                        )
                         if not args.language:
                             for counter, poc in enumerate(sorted_pocs, start=1):
                                 if counter > args.limit:
@@ -781,6 +912,7 @@ def main():
                                     f"\n[red3][-][/red3] No PoCs found in [orange_red1]{args.language}[/orange_red1]!"
                                 )
                     else:
+                        gh_poc_count = len(trickest_cve_pocs)
                         for counter, poc in enumerate(trickest_cve_pocs, start=1):
                             poc_title = f"PoC n°{counter}"
                             if counter > args.limit:
@@ -863,6 +995,16 @@ def main():
             rprint(
                 "[red3][-][/red3] No pre-built vulnerable Docker environment found!\n"
             )
+
+    # Defensive triage summary: fold KEV/EPSS/PoC/weaponization/fix signals into a
+    # single urgency verdict, and flag the "public exploit but no vendor fix" case.
+    triage = compute_triage(
+        cve_record,
+        gh_poc_count=gh_poc_count,
+        gh_max_stars=gh_max_stars,
+        other_sources=sources,
+    )
+    rprint(display_triage(cve_id.upper(), triage))
 
 
 if __name__ == "__main__":

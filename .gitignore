@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+uv.lock
+
+.env
+
+.cve2poc/
+*.log
+cve2poc_report_*.json
+cve2poc_report_*.html
+
+# Internal local notes, not published documentation.
+doc/README.JAD
+docs/README.JAD

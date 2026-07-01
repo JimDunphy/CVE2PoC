@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup as bsoup
 
 import re
 import csv
+import gzip
 import math
 from datetime import datetime
 
@@ -40,7 +41,7 @@ def is_kev(kevs, cve_id):
 def get_cvss_2_0_base_severity(base_score):
     """
     This function returns a severity for CVSS2.0
-    
+
     :param base_score: The CVSS2.0 score of a CVE ID
     """
     if base_score < 4.0:
@@ -53,14 +54,18 @@ def get_cvss_2_0_base_severity(base_score):
 
 def download_first_epss():
     """
-    This function downloads and returns FIRST EPSS data using a CI (CVE2PoC-CI) running on my GitHub repository
+    This function downloads and returns FIRST EPSS data from FIRST's public feed.
     """
     epss_data = requests.get(
-        "https://raw.githubusercontent.com/0liverFlow/CVE2PoC-CI/refs/heads/main/epss_scores-current.csv",
+        "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz",
         headers={"User-Agent": get_user_agent()},
     )
     if epss_data.status_code == 200:
-        return list(csv.DictReader(epss_data.text.splitlines()))
+        epss_text = gzip.decompress(epss_data.content).decode("utf-8")
+        epss_lines = [
+            line for line in epss_text.splitlines() if not line.startswith("#")
+        ]
+        return list(csv.DictReader(epss_lines))
     else:
         return None
 
@@ -68,7 +73,7 @@ def download_first_epss():
 def get_epss(cve_id, epss_dict):
     """
     The function returns the EPSS score for a CVE ID
-    
+
     :param cve_id: The CVE ID specified by the user
     :param epss_dict: A dictionary containing EPSS data
     """
@@ -239,6 +244,48 @@ def get_cve_info_from_adp(adps):
     return vector_string, base_score, severity
 
 
+def extract_fix_info(cve_org_json_response):
+    """
+    Extract vendor-fix signals from a CVE.org (CVE JSON 5.x) record so the
+    defensive triage can flag the dangerous "public exploit but no fix" case.
+
+    Looks for: a vendor-provided solution, a patched/unaffected version in the
+    affected ranges, and references explicitly tagged as a patch.
+
+    :param cve_org_json_response: parsed CVE.org record JSON
+    :returns: dict with keys 'fixed_versions', 'patch_references', 'has_solution'
+    """
+    info = {"fixed_versions": [], "patch_references": [], "has_solution": False}
+    try:
+        cna = cve_org_json_response["containers"]["cna"]
+    except (KeyError, TypeError):
+        return info
+
+    # Vendor-provided remediation/solution text
+    if cna.get("solutions"):
+        info["has_solution"] = True
+
+    # Fixed versions declared in the affected ranges
+    for affected in cna.get("affected", []) or []:
+        for version in affected.get("versions", []) or []:
+            if version.get("status") == "unaffected" and version.get("version"):
+                info["fixed_versions"].append(version["version"])
+            # An affected range bounded by lessThan implies a fix boundary
+            elif version.get("status") == "affected" and version.get("lessThan"):
+                info["fixed_versions"].append(version["lessThan"])
+
+    # References explicitly tagged as a patch
+    for ref in cna.get("references", []) or []:
+        tags = [t.lower() for t in ref.get("tags", []) or []]
+        if "patch" in tags and ref.get("url"):
+            info["patch_references"].append(ref["url"])
+
+    # De-duplicate while preserving order
+    info["fixed_versions"] = list(dict.fromkeys(info["fixed_versions"]))
+    info["patch_references"] = list(dict.fromkeys(info["patch_references"]))
+    return info
+
+
 def retrieve_cve_info_from_cve_org(cve_id, headers):
     """
     This function retrieve a CVE ID information using Cve.org
@@ -277,6 +324,8 @@ def retrieve_cve_info_from_cve_org(cve_id, headers):
             f"{cve_org_json_response['containers']['cna']['affected'][0].get('product', 'N/A')}"
         )
         cve_info["state"] = f"{cve_org_json_response['cveMetadata']['state']}"
+        # Vendor-fix signals for the defensive triage (see extract_fix_info)
+        cve_info.update(extract_fix_info(cve_org_json_response))
         cve_info["cwe"] = []
 
         if cve_org_json_response.get("containers") is not None:
@@ -595,9 +644,11 @@ def retrieve_cve_info_from_cve_org(cve_id, headers):
                 headers={"User-Agent": get_user_agent()},
             )
             if response.status_code == 200:
-                cve_state = response.json()["state"]
+                reservation = response.json()
+                cve_state = reservation["state"]
                 if cve_state == "RESERVED":
                     cve_info["state"] = "RESERVED"
+                    cve_info["owning_cna"] = reservation.get("owning_cna", "N/A")
                     return cve_info
             # No information was neither found on Cve.org nor on NVD for the specified CVE ID
             return None
@@ -628,7 +679,7 @@ def get_cve_description(cve_id):
         return nvd_response.json()["vulnerabilities"][0]["cve"]["descriptions"][0][
             "value"
         ]
-    
+
     return "N/A"
 
 def check_ransomware_group_usage(cve_id):
@@ -649,7 +700,7 @@ def check_ransomware_group_usage(cve_id):
 
 def check_cve_id_format(cve_id):
     """
-    This function checks the format of a CVE ID 
+    This function checks the format of a CVE ID
 
     :param cve_id: The CVE ID specified by the user
     """
@@ -661,7 +712,7 @@ def check_cve_id_format(cve_id):
 
 def get_cve_references(cve_id, cve_record):
     """
-    This function returns a CVE ID's references 
+    This function returns a CVE ID's references
 
     :param cve_id: The CVE ID specified by the user
     """

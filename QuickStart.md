@@ -4,11 +4,13 @@ See and track the CVEs affecting your Zimbra version and their public exploits,
 so you can decide whether a CVE is actually worth patching.
 
 Why this exists: Zimbra updates are often feature updates, not narrow security
-patches, and applying them can break production systems. At the same time,
-Zimbra's own security notes, NVD/CVE.org records, public PoC indexes, and
-third-party CVE sites do not always line up cleanly. This tool gives you the
-defensive context an operator needs before deciding whether to patch now, test
-first, mitigate, or keep watching.
+patches, so production operators need meaningful test time before rolling them
+out. Zero-days and actively exploited CVEs compress that window: you either
+trust the update, understand what changed in the patch, mitigate the exposed
+surface, or keep watching. At the same time, Zimbra's own security notes,
+NVD/CVE.org records, public PoC indexes, and third-party CVE sites do not always
+line up cleanly. This tool gives you the defensive context an operator needs
+before making that call.
 
 Everything is driven by `zimbra-cve.sh` with a simple verb:
 
@@ -75,9 +77,13 @@ Every CVE also carries **Fixed? = No unless there's a credible fix record** —
 Zimbra not reporting a fix does not count as fixed. It's read-only and it's a
 full scan (~150 CVEs, ~30–60s).
 
-The CVE IDs are clickable terminal hyperlinks to NVD in terminals that support
-OSC-8 links, such as GNOME Terminal. Terminals without OSC-8 support, including
-some macOS terminal setups, will still show the plain CVE IDs.
+In the `./zimbra-cve.sh show 10.1` list, CVE IDs are clickable terminal
+hyperlinks to NVD in terminals that support OSC-8 links, such as GNOME Terminal.
+Use those links for the source record, then use `./zimbra-cve.sh cve CVE-...` to
+drill into public PoCs and references when you need to understand whether the
+vulnerability is plausibly reachable in your Zimbra environment. Terminals
+without OSC-8 support, including some macOS terminal setups, will still show the
+plain CVE IDs.
 
 ## 3. Dig into one CVE
 
@@ -112,5 +118,5 @@ Each version keeps its own history, so you can watch several (10.1, 10.0, 9.0,
 
 `show` vs `watch`: use **show** to look now (full list, read-only); use **watch**
 to be told what changed (stateful, for cron). Full command reference is in
-[`doc/usage.md`](doc/usage.md); the project's charter is in
+[`doc/Usage.md`](doc/Usage.md); the project's charter is in
 [`doc/SCOPE.md`](doc/SCOPE.md).

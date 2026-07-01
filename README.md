@@ -62,9 +62,6 @@ To install directly without the wrapper:
 uv tool install --force --python 3.12 <path-to-this-checkout>
 ```
 
-Install from this checkout or from `JimDunphy/CVE2PoC` if you need the
-Zimbra/watch/fix-triage features.
-
 ## Direct `cve2poc` Commands
 
 The wrapper is easiest for Zimbra, but the direct CLI is still available:
@@ -104,7 +101,7 @@ Run `cve2poc --help` for the complete current option list.
 ## Documentation
 
 - [QuickStart.md](QuickStart.md) - shortest path for the Zimbra workflow.
-- [doc/usage.md](doc/usage.md) - direct `cve2poc` usage and watch-mode details.
+- [doc/Usage.md](doc/Usage.md) - direct `cve2poc` usage and watch-mode details.
 - [doc/SCOPE.md](doc/SCOPE.md) - what this project is and is not trying to do.
 
 ## Scope And Safety

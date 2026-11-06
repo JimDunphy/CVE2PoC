@@ -33,6 +33,7 @@ from CVE2PoC.core.report import (
     generate_json_report,
     generate_html_report,
     get_cve_record_and_exploits,
+    add_discovery_to_report,
 )
 from CVE2PoC.core.bug_bounty import search_bug_bounty_reports
 from CVE2PoC.core.cpe import cpe_to_cveid, cveid_to_cpe
@@ -43,10 +44,10 @@ from CVE2PoC.core.labs import (
 from CVE2PoC.core.exploits import (
     download_exploits_db,
     search_exploits_from_other_sources,
-    search_github_exploits,
-    get_exploit_programming_language,
 )
-from CVE2PoC.core.display import display_cve_info, display_poc_info
+from CVE2PoC.core.display import display_cve_info
+from CVE2PoC.core.discovery import GithubDiscoveryClient
+from CVE2PoC.core.discovery_output import poc_metrics, render_discovery
 from CVE2PoC.core.triage import compute_triage, display_triage
 from CVE2PoC.core.cve import (
     check_cve_id_format,
@@ -63,7 +64,7 @@ from CVE2PoC.core.config import BASE_DIR
 
 # Single source of truth for the version (read dynamically by hatchling in
 # pyproject.toml). Bump this on every change.
-__version__ = "1.5.5"
+__version__ = "1.5.6"
 __fork_name__ = "Zimbra defensive fork"
 __fork_maintainer__ = "J Dunphy"
 
@@ -306,6 +307,7 @@ def main():
         nvd_headers["apiKey"] = nvd_api_key
 
     headers.extend([github_headers, nvd_headers])
+    discovery_client = GithubDiscoveryClient(headers=github_headers)
 
     # Display the README.md file for a repository
     if args.examine is not None:
@@ -530,6 +532,7 @@ def main():
                             kevs,
                             epss_data,
                             exploits_db,
+                            discovery_client,
                         ): cve_id
                         for cve_id in cve_ids
                     }
@@ -548,7 +551,7 @@ def main():
                         cve_id = result["cve_id"]
                         cve_record = result["cve_record"]
                         pocs_from_other_sources = result["pocs_from_other_sources"]
-                        gh_exploits, poc_url = result["github_pocs"]
+                        discovery = result["github_discovery"]
 
                         # Check the state of the CVE ID
                         if cve_record is None:
@@ -607,14 +610,7 @@ def main():
                             )
                             json_report[cve_id.upper()]["PoCs"] = {}
 
-                        # GitHub PoCs
-                        if len(gh_exploits):
-                            json_report[cve_id.upper()]["PoCs"]["GitHub"] = (
-                                poc_url,
-                                len(gh_exploits),
-                            )
-                        else:
-                            json_report[cve_id.upper()]["PoCs"]["GitHub"] = "No"
+                        add_discovery_to_report(json_report[cve_id.upper()], discovery)
                         if len(pocs_from_other_sources):
                             # Metasploit PoCs
                             if (
@@ -759,176 +755,13 @@ def main():
                 rprint(reference_table)
                 sys.exit(0)
 
-            # Search PoCs
-            # Track public-PoC signals for the defensive triage summary
-            gh_poc_count = 0
-            gh_max_stars = 0
             progress.add_task(
-                description="[bright_blue][*][/bright_blue] Searching Exploits...",
+                description="[bright_blue][*][/bright_blue] Discovering public references...",
                 total=None,
             )
-            gh_api_key = github_headers.get("Authorization", None)
-            # Nomi-sec GitHub PoCs
-            gh_pocs, poc_url = search_github_exploits(cve_id, github_headers)
-            if poc_url.endswith(".json"):
-                # Ranking PoCs by their number of stars and forks. Make sure to always read the code though
-                sorted_pocs = sorted(
-                    gh_pocs,
-                    key=lambda x: (x["stargazers_count"], x["forks"]),
-                    reverse=True,
-                )
-                n_pocs = len(sorted_pocs)
-                gh_poc_count = n_pocs
-                gh_max_stars = sorted_pocs[0]["stargazers_count"] if sorted_pocs else 0
-                for i in range(n_pocs):
-                    # By default, the program will return the first 10 exploits. This behavior can be changed by specifying the args.limit option
-                    if i < args.limit:
-                        sorted_pocs[i]["programming_language"] = (
-                            get_exploit_programming_language(
-                                sorted_pocs[i]["full_name"], github_headers
-                            )
-                        )
-
-                # Filtering PoCs by programming language (This is generally useful for LPE)
-                if not args.language:
-                    for counter, poc in enumerate(sorted_pocs, start=1):
-                        if counter > args.limit:
-                            break
-                        poc_title = f"PoC n°{counter}"
-                        rprint(display_poc_info(poc, poc_title, gh_api_key))
-                else:
-                    poc_number = 1
-                    programming_language_found = False
-                    for counter, poc in enumerate(sorted_pocs, start=1):
-                        if counter > args.limit:
-                            break
-                        if (
-                            poc["programming_language"].capitalize()
-                            == args.language.capitalize()
-                        ):
-                            poc_title = f"PoC n°{poc_number}"
-                            rprint(display_poc_info(poc, poc_title, gh_api_key))
-                            poc_number += 1
-                            programming_language_found = True
-                    if not programming_language_found:
-                        rprint(
-                            f"\n[red3][-][/red3] No PoCs found in [orange_red1]{args.language}[/orange_red1]!"
-                        )
-            elif poc_url.endswith(".md"):
-                # TrickestCVE GitHub PoCs
-                if len(gh_pocs):
-                    trickest_cve_pocs = []
-                    # If a PoC does not start with https://github.com/, this means that TrickestCVE returns references
-                    pocs_references = not all(
-                        x.text.startswith("https://github.com/") for x in gh_pocs
-                    )
-                    for counter, poc in enumerate(gh_pocs, start=1):
-                        if counter > args.limit:
-                            break
-                        html_url = poc.text
-                        # Deal with false positives
-                        if not pocs_references and html_url not in [
-                            "https://github.com/fkie-cad/nvd-json-data-feeds",
-                            "https://github.com/nomi-sec/PoC-in-GitHub",
-                            "https://github.com/ARPSyndicate/cvemon",
-                            "https://github.com/ARPSyndicate/cve-scores",
-                        ]:
-                            full_name = html_url.split("https://github.com/")[-1]
-                            # Check GitHub API rate limit (https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) for more information (By default, you have a limit of 60 requests)
-                            gh_poc_repo_info = requests.get(
-                                f"https://api.github.com/repos/{full_name}",
-                                headers=github_headers,
-                            )
-                            if gh_poc_repo_info.status_code == 200:
-                                trickest_cve_pocs.append(
-                                    {
-                                        "description": gh_poc_repo_info.json()[
-                                            "description"
-                                        ],
-                                        "created_at": gh_poc_repo_info.json()[
-                                            "created_at"
-                                        ],
-                                        "updated_at": gh_poc_repo_info.json()[
-                                            "updated_at"
-                                        ],
-                                        "stargazers_count": gh_poc_repo_info.json()[
-                                            "stargazers_count"
-                                        ],
-                                        "forks": gh_poc_repo_info.json()["forks_count"],
-                                        "html_url": gh_poc_repo_info.json()["html_url"],
-                                        "programming_language": gh_poc_repo_info.json()[
-                                            "language"
-                                        ]
-                                        if gh_poc_repo_info.json()["language"]
-                                        else "N/A",
-                                    }
-                                )
-                        elif html_url not in [
-                            "https://github.com/fkie-cad/nvd-json-data-feeds",
-                            "https://github.com/nomi-sec/PoC-in-GitHub",
-                            "https://github.com/ARPSyndicate/cvemon",
-                            "https://github.com/ARPSyndicate/cve-scores",
-                        ]:
-                            trickest_cve_pocs.append(html_url)
-
-                    if (
-                        isinstance(trickest_cve_pocs, list)
-                        and all(isinstance(x, dict) for x in trickest_cve_pocs)
-                        and len(trickest_cve_pocs) > 0
-                    ):
-                        sorted_pocs = sorted(
-                            trickest_cve_pocs,
-                            key=lambda x: (x["stargazers_count"], x["forks"]),
-                            reverse=True,
-                        )
-                        gh_poc_count = len(sorted_pocs)
-                        gh_max_stars = (
-                            sorted_pocs[0]["stargazers_count"] if sorted_pocs else 0
-                        )
-                        if not args.language:
-                            for counter, poc in enumerate(sorted_pocs, start=1):
-                                if counter > args.limit:
-                                    break
-                                poc_title = f"PoC n°{counter}"
-                                rprint(
-                                    display_poc_info(poc, poc_title, gh_api_key), end=""
-                                )
-                        else:
-                            poc_number = 1
-                            programming_language_found = False
-                            for counter, poc in enumerate(sorted_pocs, start=1):
-                                if counter > args.limit:
-                                    break
-                                if (
-                                    poc["programming_language"].capitalize()
-                                    == args.language.capitalize()
-                                ):
-                                    poc_title = f"PoC n°{poc_number}"
-                                    rprint(display_poc_info(poc, poc_title, gh_api_key))
-                                    poc_number += 1
-                                    programming_language_found = True
-                            if not programming_language_found:
-                                rprint(
-                                    f"\n[red3][-][/red3] No PoCs found in [orange_red1]{args.language}[/orange_red1]!"
-                                )
-                    else:
-                        gh_poc_count = len(trickest_cve_pocs)
-                        for counter, poc in enumerate(trickest_cve_pocs, start=1):
-                            poc_title = f"PoC n°{counter}"
-                            if counter > args.limit:
-                                break
-                            rprint(
-                                f"[red3]{' ' * 46}┌{len(f'{poc_title}') * '─'}┐\n{'─' * 46}│{poc_title.center(len(poc_title))}│{'─' * 46}\n{' ' * 46}└{len(poc_title) * '─'}┘[/red3]\n{poc}"
-                            )
-                    if not trickest_cve_pocs:
-                        rprint(
-                            f"\n[red3][-][/red3] No PoCs found on GitHub for {cve_id.upper()}!"
-                        )
-            else:
-                # No PoCs found on Nomi-sec and TrickestCVE
-                rprint(
-                    f"\n[red3][-][/red3] No PoCs found on GitHub for {cve_id.upper()}!"
-                )
+            discovery = discovery_client.discover(cve_id.upper())
+            gh_poc_count, gh_max_stars = poc_metrics(discovery)
+            rprint(render_discovery(discovery, args.limit, args.language))
         else:
             rprint("[red3][-][/red3] Please specify a CVE ID!\n")
             parser.print_help(sys.stderr)
@@ -971,7 +804,7 @@ def main():
                     else:
                         rprint(f"Nuclei:[magenta3] {nuclei_template_url}[/magenta3]\n")
         else:
-            rprint("[red3][-][/red3] No Pocs found on other sources!\n")
+            rprint("[red3][-][/red3] No matching modules/templates in the Metasploit, Exploit-DB or Nuclei indexes!\n")
 
     # Search pre-built vulnerable Docker environments in Vulhub
     with Progress(

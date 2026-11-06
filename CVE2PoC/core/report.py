@@ -1,5 +1,7 @@
 import json
 from datetime import datetime
+from html import escape
+from urllib.parse import urlsplit
 
 from CVE2PoC.core.cve import (
     is_kev,
@@ -8,9 +10,90 @@ from CVE2PoC.core.cve import (
     get_epss,
 )
 from CVE2PoC.core.exploits import (
-    search_github_exploits,
     search_exploits_from_other_sources,
 )
+from CVE2PoC.core.discovery import GithubDiscoveryClient
+
+
+def add_discovery_to_report(record, discovery):
+    """Keep legacy summary fields and also retain the complete evidence URLs."""
+    record["GitHub Discovery"] = discovery
+    pocs = discovery.get("pocs", [])
+    if pocs:
+        record["PoCs"]["GitHub"] = (pocs[0]["html_url"], len(pocs))
+    else:
+        record["PoCs"]["GitHub"] = (
+            "No" if discovery.get("pocs_complete", not discovery.get("warnings"))
+            else "Unknown"
+        )
+    record["PoCs"]["Metasploit PRs"] = discovery.get("metasploit_prs", [])
+
+
+def _evidence_link(url, label):
+    """Only emit HTTP(S) links; keep remote titles and URLs escaped in HTML."""
+    text = escape(str(label), quote=True)
+    try:
+        parsed = urlsplit(str(url))
+        safe = (
+            parsed.scheme in {"https", "http"} and parsed.hostname
+            and not parsed.username and not parsed.password
+            and not any(ord(char) < 32 or ord(char) == 127 for char in str(url))
+        )
+    except ValueError:
+        safe = False
+    if not safe:
+        return text
+    return (
+        f'<a href="{escape(str(url), quote=True)}" target="_blank" '
+        f'rel="noopener noreferrer">{text}</a>'
+    )
+
+
+def _github_discovery_cell(discovery):
+    pocs = discovery.get("pocs", [])
+    complete = discovery.get("pocs_complete", not discovery.get("warnings"))
+    flag = "" if complete else ' data-discovery-incomplete="true"'
+    summary = f"Indexed references ({len(pocs)})" if pocs else (
+        "No indexed match" if complete else "Unknown: lookup incomplete"
+    )
+    body = (
+        f'<span data-indexed-references="{len(pocs)}" '
+        f'data-discovery-complete="{str(complete).lower()}">{escape(summary)}</span>'
+    )
+    if pocs:
+        body += "<ul>" + "".join(
+            "<li>" + _evidence_link(
+                poc.get("html_url", ""), poc.get("description") or poc.get("html_url", "")
+            ) + "</li>" for poc in pocs
+        ) + "</ul>"
+    for warning in discovery.get("warnings", []):
+        body += "<div>Discovery warning: " + escape(str(warning)) + "</div>"
+    return f"<td{flag}>{body}</td>"
+
+
+def _metasploit_discovery_cell(module, discovery):
+    label = (
+        _evidence_link(module, "Indexed module")
+        if module != "No" else "No indexed module"
+    )
+    indexed = "yes" if module != "No" else "no"
+    body = f'<span data-indexed-module="{indexed}">{label}</span>'
+    prs = discovery.get("metasploit_prs", [])
+    if prs:
+        body += "<div>PR references (informational):</div><ul>"
+        for pr in prs:
+            state = pr.get("state", "unknown")
+            if pr.get("draft") and state == "open":
+                state = "open (draft)"
+            label = f"#{pr.get('number', '?')} — {state}: {pr.get('title', '')}"
+            body += "<li>" + _evidence_link(pr.get("url", ""), label) + "</li>"
+            for url in dict.fromkeys(pr.get("reference_urls", [])):
+                if url != pr.get("url"):
+                    body += "<li>" + _evidence_link(url, url) + "</li>"
+        body += "</ul>"
+    elif not discovery.get("metasploit_prs_complete", not discovery.get("warnings")):
+        body += "<div>PR lookup incomplete</div>"
+    return "<td>" + body + "</td>"
 
 
 def generate_json_report(data, output_dir_path):
@@ -390,7 +473,7 @@ def generate_html_report(data, output_dir_path):
                     <th>Vector String</th>
                     <th>GitHub</th>
                     <th>ExploitDB</th>
-                    <th>Metasploit</th>
+                    <th>Metasploit module / PR references</th>
                     <th>Nuclei</th>
                 </tr>
             </thead>
@@ -423,7 +506,7 @@ def generate_html_report(data, output_dir_path):
                 </th>
                 <th><input type="text" placeholder="CWE..." /></th>
                 <th><input type="text" placeholder="Vector..." /></th>
-                <th><select><option value="">All</option><option>Yes</option><option>No</option></select></th>
+                <th><select><option value="">All</option><option>Yes</option><option>No</option><option>Unknown</option></select></th>
                 <th><select><option value="">All</option><option>Yes</option><option>No</option></select></th>
                 <th><select><option value="">All</option><option>Yes</option><option>No</option></select></th>
                 <th><select><option value="">All</option><option>Yes</option><option>No</option></select></th>
@@ -547,7 +630,8 @@ def generate_html_report(data, output_dir_path):
                     targets: 6,
                     render: function(data, type) {
 
-                        let match = data.match(/\\((\\d+)\\)/);
+                        let count = data.match(/data-indexed-references="(\\d+)"/);
+                        let match = count || data.match(/\\((\\d+)\\)/);
                         let num = match ? parseInt(match[1]) : 0;
 
                         if (type === 'sort' || type === 'type') {
@@ -555,9 +639,22 @@ def generate_html_report(data, output_dir_path):
                         }
 
                         if (type === 'filter') {
+                            if (num === 0 && (count
+                                ? data.includes('data-discovery-complete="false"')
+                                : data.includes('Unknown: lookup incomplete'))) return 'Unknown';
                             return num > 0 ? 'Yes' : 'No';
                         }
 
+                        return data;
+                    }
+                },
+                {
+                    targets: 8,
+                    render: function(data, type) {
+                        if (type === 'filter') {
+                            if (data.includes('data-indexed-module="yes"')) return 'Yes';
+                            if (data.includes('data-indexed-module="no"')) return 'No';
+                        }
                         return data;
                     }
                 }
@@ -633,23 +730,30 @@ def generate_html_report(data, output_dir_path):
     """
 
     for cve, cve_data in data.items():
-        if cve_data["PoCs"]["GitHub"] != "No":
-            if "nomi-sec" in cve_data["PoCs"]["GitHub"][0]:
-                gh_td = f"<td><span class='badge yes'><a href='https://poc-in-github.motikan2010.net/api/v1/?cve_id={cve}' target='_blank'>Yes ({cve_data['PoCs']['GitHub'][-1]})</a></span></td>"
-            # gh_td = f"<td><span class='badge yes'><a href='https://poc-in-github.motikan2010.net/api/v1/?cve_id={cve}' target='_blank'>Yes</a></span></td>"
-            # gh_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['GitHub']}' target='_blank'>Yes</a></span></td>"
-            else:
-                gh_td = f"<td><span class='badge yes'><a href='https://github.com/trickest/cve/blob/main{cve_data['PoCs']['GitHub'][0].split('main')[-1]}' target='_blank'>Yes ({cve_data['PoCs']['GitHub'][-1]})</a></span></td>"
+        discovery = cve_data.get("GitHub Discovery")
+        if discovery is not None:
+            gh_td = _github_discovery_cell(discovery)
         else:
-            gh_td = "<td><span class='badge no'>No</a></span></td>"
+            if cve_data["PoCs"]["GitHub"] != "No":
+                if "nomi-sec" in cve_data["PoCs"]["GitHub"][0]:
+                    gh_td = f"<td><span class='badge yes'><a href='https://poc-in-github.motikan2010.net/api/v1/?cve_id={cve}' target='_blank'>Yes ({cve_data['PoCs']['GitHub'][-1]})</a></span></td>"
+                # gh_td = f"<td><span class='badge yes'><a href='https://poc-in-github.motikan2010.net/api/v1/?cve_id={cve}' target='_blank'>Yes</a></span></td>"
+                # gh_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['GitHub']}' target='_blank'>Yes</a></span></td>"
+                else:
+                    gh_td = f"<td><span class='badge yes'><a href='https://github.com/trickest/cve/blob/main{cve_data['PoCs']['GitHub'][0].split('main')[-1]}' target='_blank'>Yes ({cve_data['PoCs']['GitHub'][-1]})</a></span></td>"
+            else:
+                gh_td = "<td><span class='badge no'>No</a></span></td>"
         if cve_data["PoCs"]["ExploitDB"] != "No":
             exploit_db_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['ExploitDB']}' target='_blank'>Yes</a></span></td>"
         else:
             exploit_db_td = "<td><span class='badge no'>No</a></span></td>"
-        if cve_data["PoCs"]["Metasploit"] != "No":
-            msf_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['Metasploit']}' target='_blank'>Yes</a></span></td>"
+        if discovery is not None:
+            msf_td = _metasploit_discovery_cell(cve_data["PoCs"]["Metasploit"], discovery)
         else:
-            msf_td = "<td><span class='badge no'>No</a></span></td>"
+            if cve_data["PoCs"]["Metasploit"] != "No":
+                msf_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['Metasploit']}' target='_blank'>Yes</a></span></td>"
+            else:
+                msf_td = "<td><span class='badge no'>No</a></span></td>"
         if cve_data["PoCs"]["Nuclei"] != "No":
             nuclei_td = f"<td><span class='badge yes'><a href='{cve_data['PoCs']['Nuclei']}' target='_blank'>Yes</a></span></td>"
         else:
@@ -698,7 +802,9 @@ def generate_html_report(data, output_dir_path):
         return True
     return False
 
-def get_cve_record_and_exploits(cve_id, headers, kevs, epss_data, exploits_db):
+def get_cve_record_and_exploits(
+    cve_id, headers, kevs, epss_data, exploits_db, discovery_client=None
+):
     """
     This function retrieves cve_record and exploits related to a CVE ID
 
@@ -708,6 +814,7 @@ def get_cve_record_and_exploits(cve_id, headers, kevs, epss_data, exploits_db):
     :param exploits_db: This stores Nuclei templates, Metasploit and Exploit-DB exploits databases
     :param cve_id: The CVE ID
     """
+    cve_id = cve_id.upper()
     github_headers = headers[0]
     # Checking whether the submitted CVE is valid or not
     if not check_cve_id_format(cve_id):
@@ -732,11 +839,12 @@ def get_cve_record_and_exploits(cve_id, headers, kevs, epss_data, exploits_db):
     pocs_from_other_sources = search_exploits_from_other_sources(
         cve_id, msf_modules_db_json, exploit_db_csv, nuclei_db_json
     )
-    gh_pocs, poc_url = search_github_exploits(cve_id, github_headers)
+    discovery = (discovery_client or GithubDiscoveryClient(headers=github_headers)).discover(cve_id)
 
     return {
         "cve_id": cve_id,
         "cve_record": cve_record,
         "pocs_from_other_sources": pocs_from_other_sources,
-        "github_pocs": (gh_pocs, poc_url),
+        "github_pocs": (discovery["pocs"], "combined.json"),
+        "github_discovery": discovery,
     }, None

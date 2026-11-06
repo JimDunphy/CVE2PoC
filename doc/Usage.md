@@ -122,6 +122,47 @@ not a guarantee no patch exists.
 > The Nuclei line is a source signal only. This tool does not run Nuclei or scan
 > hosts; it reports that a public template exists.
 
+### GitHub indexes and Metasploit pull requests
+
+GitHub discovery checks **both** Nomi-sec and Trickest, combines their entries,
+and keeps each original repository, file, directory, or pull request (PR) link. Repository
+metadata is fetched using only `owner/repository`; a link to a specific file or
+PR is not replaced with the repository homepage. Metadata failures leave the
+reference visible, and stars on a parent repository do not become stars on an
+individual file or PR.
+
+The tool also searches titles and descriptions of pull requests in
+`rapid7/metasploit-framework` for the exact CVE ID. For example:
+
+```bash
+cve2poc CVE-2026-93637
+```
+
+Matching PRs appear under **Metasploit PR references (informational)** with
+their current open, draft, closed, merged, or unknown status. A PR reference is
+a candidate for manual review: it does not establish that a module was merged,
+released, or verified. PR references do not increase the GitHub PoC count or
+the weaponized-module score. The existing Metasploit module index remains the
+source for that score, even when a PR is marked merged.
+
+Discovery reuses `GITHUB_API_TOKEN` for GitHub's application programming
+interface (API) when configured; raw index requests do not receive that token.
+Requests have finite
+timeouts and results are cached within a run. Index collection is bounded to
+50 entries per source and PR search to 20 results per CVE; incomplete or
+truncated results produce warnings. GitHub rate limits stop further API
+lookups in that run and leave an explicit warning. An unavailable source is
+reported as incomplete rather than as a successful search with no matches.
+`--limit` controls terminal display; `--language` filters indexed references
+using repository language metadata and does not hide PR mentions.
+
+The same discovery data is available in single-CVE output, batch JSON/HTML,
+`--list`, `--zimbra-scan`, and watch state. Batch JSON keeps full evidence URLs,
+PR status, source warnings, and completion flags under `GitHub Discovery`.
+The HTML Metasploit Yes/No filter refers to indexed modules, independently of
+the informational PR links in that column. Discovery reads public indexes and
+GitHub metadata; it does not fetch or execute the linked PoC code.
+
 ---
 
 ## 3. Watch a product for new / worsening CVEs
@@ -163,7 +204,7 @@ cve2poc --watch "cpe:2.3:a:zimbra:collaboration:10.0.0"
 
 ```
 [+] No new CVEs since last run.
-⚠ Existing CVEs that worsened
+Updates to tracked CVEs
   CVE-2024-27443: added to CISA KEV, weaponized exploit module appeared,
                   new public PoC(s) (0→5), EPSS jump (1.0%→19.54%),
                   entered danger zone (public exploit, no fix)
@@ -172,6 +213,13 @@ cve2poc --watch "cpe:2.3:a:zimbra:collaboration:10.0.0"
 A CVE is reported as *worsened* when any of these happen since the last run:
 added to CISA KEV · a weaponized module appeared · new public PoC(s) ·
 EPSS jumped ≥10 points · it entered the danger zone.
+
+New Metasploit PR references and changes to their status are also reported as
+updates, without changing the risk score on that basis. A failed or partial PR
+search retains previously observed PR references and their last known status,
+with a warning that the refresh is incomplete. Unchanged PRs remain in saved
+state and can be displayed with `--show-state`; source warnings remain visible
+on watch runs even when no CVE changed.
 
 ### Run it on a schedule (cron)
 
@@ -255,3 +303,32 @@ Produces `cve2poc_report_<date>_<time>.json` and `.html` (sortable table) in
 
 The ASCII banner is **off by default**; add `--banner` to show it, or run
 `cve2poc --version`. Run `cve2poc --help` for the full flag list.
+
+---
+
+## 7. Run the discovery regression tests
+
+From a checkout, install the project dependencies and run the offline tests:
+
+```bash
+uv sync --python 3.12
+uv run python -m unittest discover -s tests -v
+```
+
+The tests use mocked public-source responses and make no network requests.
+They cover exact-CVE PR discovery, preserved URLs, rate limits and malformed
+responses, triage separation, CLI/report integration, and watch-state updates.
+One HTML-filter test executes the generated JavaScript when `node` is on PATH;
+it is skipped otherwise. Node is not a runtime dependency of CVE2PoC.
+
+To check live discovery using this checkout:
+
+```bash
+uv run cve2poc --version
+uv run cve2poc CVE-2026-93637
+```
+
+These commands use the project's local environment. They do not reinstall the
+separately installed `cve2poc` tool used by `./zimbra-cve.sh`. Check any discovery
+warnings when reviewing the result: a failed search cannot establish that no
+public references exist.

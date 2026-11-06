@@ -3,9 +3,10 @@ Product watch mode for CVE2PoC.
 
 Defenders don't think in CVE IDs — they think "I run Zimbra 10.0.x". This module
 takes a CPE, resolves the CVEs affecting it, triages each one, and — by keeping a
-small state file between runs — reports only what is *new or has worsened* since
+small state file between runs — reports what is *new or has worsened* since
 last time (new CVE, newly added to CISA KEV, a PoC just dropped, an EPSS spike,
-or a slide into the "public exploit, no fix" danger zone).
+or a slide into the "public exploit, no fix" danger zone), plus changes to
+tracked Metasploit PR references.
 
 Run it from cron against your product CPE and it becomes an early-warning feed
 instead of something you only reach for after hearing a rumor.
@@ -20,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich import print as rprint
 from rich.table import Table
+from rich.text import Text
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -31,6 +33,8 @@ from rich.progress import (
 
 from CVE2PoC.core.cpe import cpe_to_cveid
 from CVE2PoC.core.cve import download_cisa_kev, download_first_epss
+from CVE2PoC.core.discovery import GithubDiscoveryClient
+from CVE2PoC.core.discovery_output import plain_text, poc_metrics
 from CVE2PoC.core.exploits import download_exploits_db
 from CVE2PoC.core.report import get_cve_record_and_exploits
 from CVE2PoC.core.triage import compute_triage, LABEL_COLORS
@@ -74,14 +78,15 @@ def _save_state(path, state):
         json.dump(state, f, indent=2)
 
 
-def _snapshot(cve_id, headers, kevs, epss_data, exploits_db):
+def _snapshot(cve_id, headers, kevs, epss_data, exploits_db, discovery_client=None):
     """
     Build a compact, comparable snapshot of a CVE's current risk posture.
     Returns (cve_id, snapshot_dict) or (cve_id, None) if it should be skipped
     (no record, reserved, or rejected).
     """
     result, error = get_cve_record_and_exploits(
-        cve_id, headers, kevs, epss_data, exploits_db
+        cve_id, headers, kevs, epss_data, exploits_db,
+        discovery_client=discovery_client,
     )
     if error or result is None:
         return cve_id, None
@@ -91,8 +96,10 @@ def _snapshot(cve_id, headers, kevs, epss_data, exploits_db):
         return cve_id, None
 
     gh_exploits, _ = result["github_pocs"]
-    gh_count = len(gh_exploits) if gh_exploits else 0
     other_sources = result["pocs_from_other_sources"]
+    discovery = result.get("github_discovery") or {"pocs": gh_exploits or []}
+    gh_count, _ = poc_metrics(discovery)
+    discovery_warnings = list(discovery.get("warnings") or [])
 
     triage = compute_triage(
         cve_record, gh_poc_count=gh_count, other_sources=other_sources
@@ -110,11 +117,79 @@ def _snapshot(cve_id, headers, kevs, epss_data, exploits_db):
         "label": triage["label"],
         "danger_zone": triage["danger_zone"],
         "product": cve_record.get("affected_product", "N/A"),
+        # PR references are discovery context, not indexed PoCs or proof that a
+        # module is available. Keep them out of the triage inputs above.
+        "metasploit_prs": [dict(pr) for pr in discovery.get("metasploit_prs", [])],
+        "metasploit_prs_complete": discovery.get(
+            "metasploit_prs_complete", not discovery_warnings
+        ),
+        "discovery_warnings": discovery_warnings,
     }
 
 
+def _pr_status(pr):
+    """Use the verified PR state without implying that an open PR was merged."""
+    state = pr.get("state") or "unknown"
+    if state == "open" and pr.get("draft"):
+        return "open (draft)"
+    return state
+
+
+def _retain_pr_evidence(old, snap):
+    """Preserve last-known PR references when the current search is incomplete.
+
+    A failed or partial search is not evidence that a previously observed PR
+    disappeared. Fresh results take precedence, including any verified state
+    changes, while missing references survive until a complete search succeeds.
+    """
+    if snap.get("metasploit_prs_complete", True):
+        return snap
+
+    current = {pr["url"]: dict(pr) for pr in snap.get("metasploit_prs", [])}
+    retained = 0
+    references_retained = False
+    for previous in old.get("metasploit_prs", []):
+        fresh = current.get(previous["url"])
+        reference_urls = list(dict.fromkeys(
+            (fresh or {}).get("reference_urls", []) + previous.get("reference_urls", [])
+        ))
+        if fresh is None or (
+            _pr_status(fresh) == "unknown" and _pr_status(previous) != "unknown"
+        ):
+            current[previous["url"]] = dict(previous)
+            retained += 1
+        elif (
+            fresh.get("state") == previous.get("state")
+            and fresh.get("draft") is None
+            and previous.get("draft") is not None
+        ):
+            fresh["draft"] = previous["draft"]
+            if "status" in previous:
+                fresh["status"] = previous["status"]
+            retained += 1
+        kept = current[previous["url"]]
+        if reference_urls and kept.get("reference_urls") != reference_urls:
+            kept["reference_urls"] = reference_urls
+            references_retained = True
+    if not retained and not references_retained:
+        return snap
+
+    updated = dict(snap)
+    updated["metasploit_prs"] = list(current.values())
+    updated["discovery_warnings"] = list(snap.get("discovery_warnings") or [])
+    warning = (
+        f"Metasploit PR search incomplete; retaining {retained} previously "
+        "observed PR reference(s) with last known status."
+    ) if retained else (
+        "Metasploit PR search incomplete; retaining previously observed PR evidence URLs."
+    )
+    if warning not in updated["discovery_warnings"]:
+        updated["discovery_warnings"].append(warning)
+    return updated
+
+
 def _detect_changes(old, snap):
-    """Return a list of human-readable worsening events between two snapshots."""
+    """Return worsening risk signals and changes to public PR references."""
     deltas = []
     if old.get("kev") != "Yes" and snap["kev"] == "Yes":
         deltas.append("added to CISA KEV")
@@ -131,6 +206,17 @@ def _detect_changes(old, snap):
         deltas.append(f"EPSS jump ({old_epss}%→{new_epss}%)")
     if not old.get("danger_zone") and snap["danger_zone"]:
         deltas.append("entered danger zone (public exploit, no fix)")
+
+    previous_prs = {pr["url"]: pr for pr in old.get("metasploit_prs", [])}
+    for pr in snap.get("metasploit_prs", []):
+        previous = previous_prs.get(pr["url"])
+        status = _pr_status(pr)
+        if previous is None:
+            deltas.append(f"new Metasploit PR ({status}): {pr['url']}")
+        elif status != "unknown" and _pr_status(previous) != status:
+            deltas.append(
+                f"Metasploit PR {pr['url']}: {_pr_status(previous)}→{status}"
+            )
     return deltas
 
 
@@ -141,8 +227,6 @@ def _cve_link(cve_id):
     fragment it into multiple spans. Terminals that support OSC 8 make it
     clickable; the rest just show the plain ID.
     """
-    from rich.text import Text
-
     # Use an explicit span, not a base Text style. Rich may pad table cells to
     # the column width; a base style can make that trailing whitespace clickable.
     link = Text(cve_id)
@@ -156,12 +240,48 @@ def _cve_link(cve_id):
 
 def _cve_status_line(cve_id, message):
     """Render an inline status line with a single linked CVE ID span."""
-    from rich.text import Text
-
     line = Text("  ")
     line.append_text(_cve_link(cve_id))
     line.append(f": {message}")
     return line
+
+
+def _print_discovery_details(rows, pr_cve_ids=None):
+    """Show selected PR context and all source failures, even on unchanged runs.
+
+    Text objects keep titles, URLs, and error messages literal rather than
+    interpreting untrusted source text as Rich markup. Repeated source failures
+    are grouped so a shared outage does not print once per CVE.
+    """
+    warnings = {}
+    for cve_id, snap in rows:
+        prs = snap.get("metasploit_prs", []) if (
+            pr_cve_ids is None or cve_id in pr_cve_ids
+        ) else []
+        for pr in prs:
+            number = f" #{pr['number']}" if pr.get("number") else ""
+            line = _cve_status_line(
+                cve_id, f"Metasploit PR{number} ({_pr_status(pr)}) "
+            )
+            line.append(plain_text(pr["url"]), style="underline bright_blue")
+            if pr.get("title"):
+                line.append(f" — {' '.join(plain_text(pr['title']).split())}")
+            rprint(line)
+            for reference_url in dict.fromkeys(pr.get("reference_urls", [])):
+                if reference_url != pr["url"]:
+                    evidence = Text("    Evidence: ")
+                    evidence.append(plain_text(reference_url), style="underline bright_blue")
+                    rprint(evidence)
+        for warning in snap.get("discovery_warnings", []):
+            warnings.setdefault(warning, set()).add(cve_id)
+
+    for warning, cve_ids in warnings.items():
+        if len(cve_ids) == 1:
+            line = _cve_status_line(next(iter(cve_ids)), "Discovery incomplete: ")
+        else:
+            line = Text(f"  Discovery incomplete for {len(cve_ids)} CVEs: ")
+        line.append(plain_text(warning), style="gold1")
+        rprint(line)
 
 
 def _risk_table(title, rows):
@@ -227,6 +347,7 @@ def show_state(state_path):
         rprint(_risk_table("🔥 Danger zone — public exploit, NO vendor fix", danger))
         print()
     rprint(_risk_table("Tracked CVEs (from saved state)", rows))
+    _print_discovery_details(rows)
     return 0
 
 
@@ -273,6 +394,10 @@ def _snapshot_all(cve_ids, headers, threads):
     Shows progress the whole way through so the tool never looks hung during the
     (potentially large) database downloads and the per-CVE lookups.
     """
+    # One client per collection shares cached references and rate-limit state
+    # across all workers.
+    discovery_client = GithubDiscoveryClient(headers=headers[0] if headers else None)
+
     # Phase 1: the big shared downloads (KEV, EPSS, Metasploit/ExploitDB/Nuclei).
     with Progress(
         SpinnerColumn(),
@@ -301,7 +426,8 @@ def _snapshot_all(cve_ids, headers, threads):
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = {
                 executor.submit(
-                    _snapshot, cve_id, headers, kevs, epss_data, exploits_db
+                    _snapshot, cve_id, headers, kevs, epss_data, exploits_db,
+                    discovery_client=discovery_client,
                 ): cve_id
                 for cve_id in cve_ids
             }
@@ -339,6 +465,7 @@ def run_list(cpe, headers, threads):
         rprint(_risk_table("🔥 Danger zone — public exploit, NO vendor fix", danger))
         print()
     rprint(_risk_table(f"CVEs affecting {cpe}", rows))
+    _print_discovery_details(rows)
     return 0
 
 
@@ -433,6 +560,7 @@ def run_zimbra_scan(spec, headers, threads):
         "[grey58]Affects column: Yes = NVD says this version is in range · "
         "no = NVD's version data excludes it · ? = no version data, verify manually[/grey58]"
     )
+    _print_discovery_details(rows)
     return 0
 
 
@@ -458,12 +586,15 @@ def run_watch(cpe, state_path, headers, threads):
         f"[bright_yellow]{cpe}[/bright_yellow] ..."
     )
     snapshots = _snapshot_all(current_ids, headers, threads)
+    for cve_id, snap in snapshots.items():
+        if cve_id in prev_cves:
+            snapshots[cve_id] = _retain_pr_evidence(prev_cves[cve_id], snap)
 
     # New CVEs (unseen in the previous run)
     new_rows = [(c, s) for c, s in snapshots.items() if c not in prev_cves]
     new_rows.sort(key=lambda x: x[1]["score"], reverse=True)
 
-    # Known CVEs whose posture has worsened
+    # Known CVEs with worsening risk signals or changes to public PR references.
     changed = []
     for cve_id, snap in snapshots.items():
         if cve_id in prev_cves:
@@ -493,12 +624,15 @@ def run_watch(cpe, state_path, headers, threads):
         rprint("[spring_green2][+][/spring_green2] No new CVEs since last run.")
 
     if changed:
-        rprint(_risk_table("⚠ Existing CVEs that worsened", [(c, s) for c, s, _ in changed]))
+        rprint(_risk_table("Updates to tracked CVEs", [(c, s) for c, s, _ in changed]))
         for cve_id, _, deltas in changed:
             rprint(_cve_status_line(cve_id, ", ".join(deltas)))
         print()
     elif not is_first_run:
-        rprint("[spring_green2][+][/spring_green2] No worsening of previously tracked CVEs.")
+        rprint(
+            "[spring_green2][+][/spring_green2] No new risk signals or "
+            "Metasploit PR changes observed in previously tracked CVEs."
+        )
 
     # When nothing changed there's no table; point the user at the full list.
     if not is_first_run and not new_rows and not changed:
@@ -506,6 +640,10 @@ def run_watch(cpe, state_path, headers, threads):
             f"[bright_blue][*][/bright_blue] {len(snapshots)} CVE(s) tracked. "
             f"See them all: cve2poc --show-state {state_path}"
         )
+
+    rows = sorted(snapshots.items(), key=lambda x: x[1]["score"], reverse=True)
+    changed_ids = {c for c, _ in new_rows} | {c for c, _, _ in changed}
+    _print_discovery_details(rows, pr_cve_ids=changed_ids)
 
     # ---- Persist state ----
     state = {

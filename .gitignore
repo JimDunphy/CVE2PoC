@@ -17,10 +17,3 @@ cve2poc_report_*.html
 doc/README.JAD
 docs/README.JAD
 doc/private/
-
-#
-codex.txt
-
-# Local handoff material; commit the implementation rather than these inputs.
-/cve2poc-codex-handoff.txt
-/cve2poc-github-discovery.patch
